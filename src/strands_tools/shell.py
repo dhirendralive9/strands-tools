@@ -108,9 +108,51 @@ class CommandExecutor:
         self.exit_code = None
         self.error = None
 
+    def _kill_process_tree(self, pid: int) -> None:
+        """Forcefully kill a process and its entire process group.
+
+        Uses SIGTERM first, then SIGKILL after a grace period to handle
+        processes that ignore SIGTERM (e.g., nmap, certain curl operations).
+        """
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            return
+
+        # Try SIGTERM first (graceful)
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        # Give 3 seconds for graceful shutdown
+        for _ in range(30):
+            try:
+                result = os.waitpid(pid, os.WNOHANG)
+                if result[0] != 0:
+                    return  # Process exited
+            except ChildProcessError:
+                return  # Already reaped
+            time.sleep(0.1)
+
+        # SIGKILL if still alive (cannot be ignored)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
     def execute_with_pty(self, command: str, cwd: str, non_interactive_mode: bool) -> Tuple[int, str, str]:
-        """Execute command with PTY and timeout support."""
+        """Execute command with PTY and timeout support.
+
+        Fixes applied (Sentinel Engine fork):
+        - Non-interactive mode no longer writes to sys.stdout (prevents pipe buffer deadlock)
+        - waitpid uses WNOHANG with timeout to prevent indefinite blocking
+        - Process kill uses SIGKILL fallback after SIGTERM grace period
+        - Output buffer is size-limited to prevent memory exhaustion
+        """
         output = []
+        output_size = 0
+        max_output_size = 10 * 1024 * 1024  # 10MB output cap
         start_time = time.time()
         old_tty = None
         pid = -1
@@ -135,12 +177,9 @@ class CommandExecutor:
                 if not non_interactive_mode and old_tty:
                     tty.setraw(sys.stdin.fileno())
                 while True:
-                    if time.time() - start_time > self.timeout:
-                        try:
-                            # This kill entire group, not just parent shell.
-                            os.killpg(os.getpgid(pid), signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
+                    elapsed = time.time() - start_time
+                    if elapsed > self.timeout:
+                        self._kill_process_tree(pid)
                         raise TimeoutError(f"Command timed out after {self.timeout} seconds")
 
                     fds_to_watch = [fd]
@@ -158,9 +197,15 @@ class CommandExecutor:
                             data = read_output(fd)
                             if not data:
                                 break
-                            output.append(data)
-                            sys.stdout.write(data)
-                            sys.stdout.flush()
+                            # Only append if under output cap
+                            if output_size < max_output_size:
+                                output.append(data)
+                                output_size += len(data)
+                            # Only write to stdout in interactive mode to prevent
+                            # pipe buffer deadlock when stdout is captured/piped
+                            if not non_interactive_mode:
+                                sys.stdout.write(data)
+                                sys.stdout.flush()
                         except OSError:
                             break
 
@@ -171,17 +216,37 @@ class CommandExecutor:
                             os.write(fd, stdin_data)
                         except OSError:
                             break
-                try:
-                    _, status = os.waitpid(pid, 0)
-                    if os.WIFEXITED(status):
-                        exit_code = os.WEXITSTATUS(status)
-                    else:
-                        exit_code = -1  # Process was terminated by a signal
-                except OSError:
-                    exit_code = -1  # waitpid failed
 
-                # In non_interactive_mode, we should not print the live output to the console.
-                # The captured output is returned for the agent to process.
+                # Non-blocking waitpid with timeout to prevent deadlock.
+                # The old code used os.waitpid(pid, 0) which blocks forever
+                # if child spawns grandchildren that keep the PTY open.
+                waitpid_deadline = time.time() + 10  # 10s grace for reaping
+                exit_code = -1
+                while time.time() < waitpid_deadline:
+                    try:
+                        wpid, status = os.waitpid(pid, os.WNOHANG)
+                        if wpid != 0:
+                            if os.WIFEXITED(status):
+                                exit_code = os.WEXITSTATUS(status)
+                            elif os.WIFSIGNALED(status):
+                                exit_code = -os.WTERMSIG(status)
+                            else:
+                                exit_code = -1
+                            break
+                    except ChildProcessError:
+                        break  # Already reaped
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+                else:
+                    # waitpid timed out — force kill
+                    logger.warning(f"waitpid timed out for pid {pid}, force killing")
+                    self._kill_process_tree(pid)
+                    try:
+                        os.waitpid(pid, 0)  # Final reap after SIGKILL
+                    except OSError:
+                        pass
+
                 return exit_code, "".join(output), ""
 
         finally:
